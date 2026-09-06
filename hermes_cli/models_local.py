@@ -18,7 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional
 from hermes_cli.urllib_security import url_origin
 
 # Log-record parity with the origin module.
@@ -576,13 +576,14 @@ def lmstudio_model_reasoning_options(
 def ollama_model_supports_thinking(
     model: str,
     base_url: Optional[str],
-    api_key: Optional[str] = None,
+    api_key: Optional[str | Callable[[], str]] = None,
     timeout: float = 5.0,
 ) -> Optional[bool]:
     """Tri-state: True if an Ollama (Cloud or local) model advertises ``thinking`` in native
     ``/api/show`` ``capabilities`` (authoritative; OpenAI-compat ``/v1/models`` omits it), False
     when the probe succeeded without it, None when it failed (caller treats as "don't emit")."""
     import httpx
+    from agent.azure_identity_adapter import materialize_bearer_for_http
 
     server_url = (base_url or "").strip().rstrip("/")
     if server_url.endswith("/v1"):
@@ -591,8 +592,9 @@ def ollama_model_supports_thinking(
     if not server_url or not bare_model:
         return None
 
-    token = str(api_key or "").strip()
     try:
+        # Manual HTTP requests must mint callable credentials instead of stringifying them.
+        token = materialize_bearer_for_http(api_key).strip() if api_key else ""
         with httpx.Client(timeout=timeout, headers={"Authorization": f"Bearer {token}"} if token else {}) as client:
             resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
             if resp.status_code != 200:

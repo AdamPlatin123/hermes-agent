@@ -172,6 +172,56 @@ class TestOllamaCloudCapabilityGating:
 class TestOllamaModelSupportsThinking:
     """The /api/show capability probe used to resolve supports_reasoning."""
 
+    def test_probe_sends_minted_command_token(self, monkeypatch):
+        from functools import partial
+        from subprocess import CompletedProcess
+
+        import httpx
+
+        from agent.command_token_source import CommandTokenSource
+        from hermes_cli.models_local import ollama_model_supports_thinking
+
+        source = CommandTokenSource("mint-test-token", "test-provider")
+        monkeypatch.setattr(
+            "agent.command_token_source.subprocess.run",
+            lambda *a, **k: CompletedProcess(a[0], 0, stdout="minted-test-token\n"),
+        )
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            return httpx.Response(200, json={"capabilities": ["thinking"]})
+
+        monkeypatch.setattr(
+            httpx, "Client", partial(httpx.Client, transport=httpx.MockTransport(respond))
+        )
+
+        assert ollama_model_supports_thinking("test-model", "https://example.invalid/v1", source) is True
+        assert len(requests) == 1
+        assert requests[0].url.path == "/api/show"
+        assert requests[0].headers["Authorization"] == "Bearer minted-test-token"
+
+    @pytest.mark.parametrize("returncode", [0, 1], ids=["empty-output", "command-failed"])
+    def test_probe_skips_request_when_command_token_fails(self, monkeypatch, returncode):
+        from subprocess import CompletedProcess
+        from unittest.mock import Mock
+
+        import httpx
+
+        from agent.command_token_source import CommandTokenSource
+        from hermes_cli.models_local import ollama_model_supports_thinking
+
+        source = CommandTokenSource("mint-test-token", "test-provider")
+        monkeypatch.setattr(
+            "agent.command_token_source.subprocess.run",
+            lambda *a, **k: CompletedProcess(a[0], returncode, stdout=""),
+        )
+        client = Mock()
+        monkeypatch.setattr(httpx, "Client", client)
+
+        assert ollama_model_supports_thinking("test-model", "https://example.invalid/v1", source) is None
+        client.assert_not_called()
+
     def _patch_show(self, monkeypatch, *, status=200, capabilities=None, raise_exc=None):
         import httpx
 
