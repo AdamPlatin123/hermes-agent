@@ -242,7 +242,8 @@ def _hydrate_hit(db, lineage_root: str, match_info: Dict[str, Any], result_detai
     except Exception as e:
         logging.warning("get_anchored_view failed for %s/%s: %s", hit_sid, msg_id, e, exc_info=True)
         return None
-    session_meta, full = _get_session_meta(db, lineage_root), result_detail == "full"
+    # A gateway lineage can span months; metadata must describe the matched session.
+    session_meta, full = _get_session_meta(db, hit_sid), result_detail == "full"
     return _discovery_entry(
         lineage_root, session_id=hit_sid,
         when=_format_timestamp(session_meta.get("started_at") or match_info.get("session_started")),
@@ -285,26 +286,16 @@ def _discover(db, query: str, role_filter: Optional[List[str]], limit: int, sort
         seen_sessions[title_lineage] = {"_title_only": True}
     # Dedupe by lineage (lineage_root -> first surviving FTS row) up to `limit`. The raw
     # owning session_id stays on the row — only it pairs validly with the FTS match id.
-    # Current-lineage hits are skipped UNLESS the transcript left live context
-    # (compression-ended, /new-reset predecessor, or an in-place compacted row on the
-    # SAME session); a live delegation child (end_reason=None) stays excluded.
+    # Parent links do not prove live context: a restart can leave an old session
+    # unended after its successor starts. Only the current session's own live rows
+    # are excluded; explicit end handling and compaction archives remain valid.
     for r in raw_results:
         if len(seen_sessions) >= limit:
             break
         raw_sid, resolved_sid = r["session_id"], _resolve_lineage(db, r["session_id"])
-        # Skip the current session lineage — UNLESS the hit's transcript has left live context. Three
-        # sub-cases: Legacy compression rotation: the FTS hit lives in a session that itself ended with
-        # end_reason='compression'. That session's content has been replaced by a summary in the
-        # continuation child, so it must stay discoverable. /new-reset (and idle/daily/CLI new_session): the
-        # predecessor was ended without carrying any transcript into the child. Same lineage root, but the
-        # prior conversation is NOT in the active context — hiding it made gateway recall go blind after
-        # every /new (#85756). A live delegation child has end_reason=None, so it stays excluded. In-place
-        # compaction: the FTS hit lives on the SAME session_id as the current session, but the matched
-        # message row is an archived (active=0, compacted=1) row. The live-context load filters active=1, so
-        # that content is no longer in context — let it through.
         is_compacted_hit = _is_compacted_message(db, r.get("id"))
         if current_lineage_root and resolved_sid == current_lineage_root and not (
-                _session_left_live_context(db, raw_sid) or is_compacted_hit):
+                raw_sid != current_session_id or _session_left_live_context(db, raw_sid) or is_compacted_hit):
             continue
         if current_session_id and raw_sid == current_session_id and not is_compacted_hit:
             continue

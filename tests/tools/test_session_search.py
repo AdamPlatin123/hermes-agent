@@ -11,10 +11,12 @@ All run zero LLM calls.
 import inspect
 import json
 import time
+from datetime import datetime, timezone
 
 import pytest
 
 from hermes_state import SessionDB
+from tools.registry import registry
 from tools.session_search_tool import (
     SESSION_SEARCH_SCHEMA,
     _format_timestamp,
@@ -322,6 +324,76 @@ class TestDiscoveryShape:
         result = json.loads(session_search(query="modpack", db=db, current_session_id="s_newest"))
         sids = [r["session_id"] for r in result["results"]]
         assert "s_newest" not in sids
+
+
+class TestGatewayRestartLineageDiscovery:
+    @pytest.fixture
+    def restarted_lineage(self, db):
+        root, owner, current = (
+            "20260812_gateway_root", "20260903_gateway_owner", "20260904_gateway_current",
+        )
+        parent = None
+        for sid, day, title in (
+            (root, "2026-08-12", "MCP серверы Hermes"),
+            (owner, "2026-09-03", "September gateway recovery"),
+            (current, "2026-09-04", "Current gateway conversation"),
+        ):
+            db.create_session(
+                sid, source="telegram", parent_session_id=parent,
+                session_key="tg:restart:1",
+            )
+            started_at = datetime.fromisoformat(day).replace(tzinfo=timezone.utc).timestamp()
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ?, title = ? WHERE id = ?",
+                (started_at, title, sid),
+            )
+            parent = sid
+        # A restart can create a successor without ever ending its predecessor.
+        for index in range(6):
+            db.append_message(
+                owner, role="user" if index % 2 == 0 else "assistant",
+                content=f"restartneedle recovery note {index}",
+                timestamp=datetime(2026, 9, 3, 12, index, tzinfo=timezone.utc).timestamp(),
+            )
+        db.append_message(current, role="user", content="currentneedle live context")
+        db._conn.commit()
+        return owner, current
+
+    @pytest.mark.parametrize("end_reason", [None, "compression", "session_reset"])
+    def test_previous_owner_is_searchable_but_current_context_is_not(
+        self, db, restarted_lineage, end_reason,
+    ):
+        owner, current = restarted_lineage
+        if end_reason is not None:
+            db.end_session(owner, end_reason)
+        result = json.loads(registry.dispatch(
+            "session_search", {"query": "restartneedle"},
+            db=db, current_session_id=current,
+        ))
+        assert result["success"] is True
+        assert [hit["session_id"] for hit in result["results"]] == [owner]
+        assert result["sessions_searched"] == result["count"] == 1
+        live = json.loads(registry.dispatch(
+            "session_search", {"query": "currentneedle"},
+            db=db, current_session_id=current,
+        ))
+        assert live["success"] is True
+        assert live["results"] == []
+
+    def test_metadata_describes_the_message_owner_not_the_lineage_root(
+        self, db, restarted_lineage,
+    ):
+        owner, _ = restarted_lineage
+        # Omit current_session_id so the visibility bug cannot mask the metadata bug.
+        result = json.loads(registry.dispatch(
+            "session_search", {"query": "restartneedle"}, db=db,
+        ))
+        assert result["success"] is True
+        hit, = result["results"]
+        assert hit["session_id"] == owner
+        assert (hit["when"], hit["title"]) == (
+            "September 03, 2026 at 12:00 AM", "September gateway recovery",
+        )
 
 
 class TestDiscoverySort:
@@ -679,8 +751,8 @@ class TestCompactionSummaryFiltering:
 # After compression (in-place compaction or legacy rotation), pre-compaction
 # content is no longer in the live context but MUST stay discoverable via
 # session_search. The old code skipped any FTS hit on the current session or
-# lineage, creating a "memory black hole". Delegation children must STAY
-# excluded — their content is still visible to the parent agent.
+# lineage, creating a "memory black hole". Live context is scoped to the
+# current session; hidden subagent sources remain excluded separately.
 # =========================================================================
 
 class TestResolveToParent:
@@ -787,14 +859,10 @@ class TestLegacyRotationDiscovery:
         assert "s_parent" in sids
 
 
-class TestDelegationExclusion:
-    """Delegation children (delegate_task) must STAY excluded — their content
-    is still visible to the parent agent. parent_session_id is set but the
-    parent does NOT have end_reason='compression'."""
+class TestSameLineageDiscovery:
+    """A shared parent link does not prove another session is live context."""
 
-    def test_delegation_parent_excluded_from_child(self, db):
-        """Child can see its own content but parent's live content stays
-        excluded (it's in context via delegation)."""
+    def test_unended_parent_surfaces_but_current_child_is_excluded(self, db):
         db.create_session("s_parent", source="cli")
         db.append_message("s_parent", role="user",
                           content="nebula deployment infrastructure setup")
@@ -808,7 +876,7 @@ class TestDelegationExclusion:
         result = json.loads(session_search(
             query="nebula deployment", db=db, current_session_id="s_child",
         ))
-        assert result["count"] == 0
+        assert [hit["session_id"] for hit in result["results"]] == ["s_parent"]
 
 
 # =========================================================================
@@ -931,7 +999,7 @@ class TestRewindExclusion:
 
 class TestLegacyContinuationPlusDelegation:
     """Regression: a delegation child created under a compression continuation
-    must stay excluded — its content is still live to the parent agent.
+    must stay excluded because subagent runs are not the user's history.
     Only the compression-ended ancestor's content should surface."""
 
     def test_compression_parent_surfaces_but_delegate_child_excluded(self, db):
@@ -955,7 +1023,7 @@ class TestLegacyContinuationPlusDelegation:
         db.create_session("s_current", source="cli", parent_session_id="s_p")
 
         # Delegation child under s_p (not compression-ended)
-        db.create_session("s_delegate", source="cli", parent_session_id="s_p")
+        db.create_session("s_delegate", source="subagent", parent_session_id="s_p")
         db.append_message("s_delegate", role="assistant",
                           content="delegated cosmic anomaly subtask results")
 
@@ -980,7 +1048,7 @@ class TestLegacyContinuationPlusDelegation:
 # current-lineage exclusion (which assumes same-root content is already in
 # context) goes blind: FTS hits in last-night's session are dropped, and
 # browse hides every recent interactive row because they all have a parent.
-# Delegation children (live parent, no end_reason) must stay excluded.
+# Hidden subagent sources must stay excluded independently of parent links.
 # =========================================================================
 
 def _seed_gateway_new_reset_chain(db, *, needle="ibuprofen night-dose protocol"):
@@ -1048,25 +1116,23 @@ class TestNewResetLineageDiscovery:
         assert result["count"] >= 1
         assert "s_cli_old" in [r["session_id"] for r in result["results"]]
 
-    def test_live_delegation_child_still_excluded(self, db):
-        """Unended parent+child (delegate_task) must stay hidden."""
+    def test_hidden_subagent_child_still_excluded(self, db):
+        """Source filtering must still hide subagent runs after lineage filtering changes."""
         db.create_session("s_parent", source="cli")
+        db.create_session(
+            "s_child", source="subagent", parent_session_id="s_parent",
+        )
         db.append_message(
-            "s_parent", role="user",
+            "s_child", role="user",
             content="nebula deployment infrastructure setup",
         )
-        db.create_session(
-            "s_child", source="cli", parent_session_id="s_parent",
-        )
         result = json.loads(session_search(
-            query="nebula deployment", db=db, current_session_id="s_child",
+            query="nebula deployment", db=db, current_session_id="s_parent",
         ))
         assert result["count"] == 0
 
-    def test_branched_parent_still_excluded(self, db):
-        """/branch verbatim-copies the transcript into the child, so the
-        parent's content IS the branch child's live context — it must not
-        surface as a same-lineage recall hit (unlike /new-reset parents)."""
+    def test_branched_parent_surfaces_but_current_copy_is_excluded(self, db):
+        """Even copied content is filtered by its owning session, not its lineage."""
         db.create_session("s_p", source="cli")
         db.append_message(
             "s_p", role="user", content="zephyr crystal cache design",
@@ -1084,7 +1150,7 @@ class TestNewResetLineageDiscovery:
             query="zephyr crystal", db=db, current_session_id="s_q",
         ))
         sids = [r["session_id"] for r in result.get("results", [])]
-        assert "s_p" not in sids
+        assert sids == ["s_p"]
 
     def test_title_match_reset_parent_not_dropped(self, db):
         _seed_gateway_new_reset_chain(db)
