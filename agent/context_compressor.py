@@ -5,6 +5,7 @@ import contextlib
 import contextvars
 import copy
 import hashlib
+import inspect
 import json
 import logging
 import sqlite3
@@ -4685,11 +4686,23 @@ Write only the summary body. Do not include any preamble or prefix."""
         focus_topic: Optional[str], memory_context: str, bypass_cooldown: bool,
     ) -> Optional[str]:
         """Run the summary LLM; a cancellation rolls back the handoff scan's self-heal mutation first."""
+        generate_summary = self._generate_summary
+        try:
+            parameters = inspect.signature(generate_summary).parameters
+        except (TypeError, ValueError):
+            # Uninspectable plugin hooks retain the legacy call shape, as at the public engine boundary.
+            parameters = {}
+        summary_kwargs = {}
+        # Older engines override this hook but inherit compress(); the recovery hint is optional.
+        if "bypass_cooldown" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+        ):
+            summary_kwargs["bypass_cooldown"] = bypass_cooldown
         # Focus-topic derivation scans user turns; only pay when a summary is generated.
         try:
-            return self._generate_summary(
+            return generate_summary(
                 turns_to_summarize, focus_topic=focus_topic or self._derive_auto_focus_topic(messages),
-                memory_context=memory_context, bypass_cooldown=bypass_cooldown,
+                memory_context=memory_context, **summary_kwargs,
             )
         except AuxiliaryExplicitCancellation:
             # Cancellation is a true no-op: restore the scan's mutation before the exception escapes.
