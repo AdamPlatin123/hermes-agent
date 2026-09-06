@@ -214,6 +214,21 @@ class TestGetCronDrainTimeout:
 
 
 class TestGeneratedSystemdUnits:
+    @pytest.mark.parametrize("system", [False, True])
+    def test_planned_restart_is_successful_and_still_restarts(self, system, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            gateway_cli, "_system_service_identity",
+            lambda _user: ("service", "service", str(tmp_path)),
+        )
+        monkeypatch.setattr(gateway_cli, "_hermes_home_for_target_user", lambda _home: str(tmp_path))
+
+        unit = gateway_cli.generate_systemd_unit(system=system).splitlines()
+
+        # Planned restarts must not trigger OnFailure alerts, but must still restart.
+        assert f"SuccessExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}" in unit
+        assert f"RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}" in unit
+        assert f"RestartPreventExitStatus={GATEWAY_FATAL_CONFIG_EXIT_CODE}" in unit
+
     def _expected_timeout_stop_sec(self) -> str:
         timeout = resolve_systemd_timeout_stop_sec(
             DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
